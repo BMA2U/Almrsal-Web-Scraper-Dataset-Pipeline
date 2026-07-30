@@ -98,7 +98,7 @@ class Config:
     LOG_FILE = os.path.join(BASE_DIR, "scraper.log")
 
     # التحكم بالسرعة
-    DELAY_BETWEEN_REQUESTS = 1.5   # ثانية بين كل طلب
+    DELAY_BETWEEN_REQUESTS = 0.5   # ثانية بين كل طلب
     MAX_RETRIES = 3                # عدد محاولات إعادة الطلب
     RETRY_DELAY = 5                # ثواني انتظار قبل إعادة المحاولة
     REQUEST_TIMEOUT = 30           # مهلة الطلب الواحد
@@ -150,13 +150,15 @@ class RateLimiter:
     def __init__(self, delay=Config.DELAY_BETWEEN_REQUESTS):
         self.delay = delay
         self.last_request_time = 0
+        self.lock = threading.Lock()
 
     def wait(self):
         """انتظار الوقت المطلوب بين الطلبات"""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.delay:
-            time.sleep(self.delay - elapsed)
-        self.last_request_time = time.time()
+        with self.lock:
+            elapsed = time.time() - self.last_request_time
+            if elapsed < self.delay:
+                time.sleep(self.delay - elapsed)
+            self.last_request_time = time.time()
 
 
 class HTTPClient:
@@ -421,7 +423,15 @@ def collect_article_urls_from_sitemaps():
     """
     logger.info("🔗 بدء جمع روابط المقالات...")
 
+    # تحميل الروابط القديمة إن وجدت للدمج
     all_article_urls = {}
+    if os.path.exists(Config.ARTICLE_URLS_FILE):
+        try:
+            with open(Config.ARTICLE_URLS_FILE, 'r', encoding='utf-8') as f:
+                all_article_urls = json.load(f)
+                logger.info(f"   📂 تم تحميل {len(all_article_urls):,} رابط قديم من الملف للدمج.")
+        except Exception as e:
+            logger.warning(f"   ⚠️ فشل تحميل الروابط القديمة: {e}")
     
     # محاولة 1: السحب عبر Sitemaps
     main_sitemap_url = f"{Config.BASE_URL}/sitemap.xml"
@@ -533,20 +543,25 @@ class CheckpointManager:
         self.data = self._load()
 
     def _load(self):
+        data = {}
         if os.path.exists(self.file):
             with open(self.file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 logger.info(f"📌 تم تحميل checkpoint: {data.get('scraped_count', 0)} مقال مُنجز")
-                return data
-        return {
-            'scraped_urls': [],
-            'failed_urls': [],
-            'scraped_count': 0,
-            'failed_count': 0,
-            'started_at': datetime.now(timezone.utc).isoformat(),
-            'last_updated': None,
-            'last_url': None,
-        }
+        if not data:
+            data = {
+                'scraped_urls': [],
+                'failed_urls': [],
+                'scraped_count': 0,
+                'failed_count': 0,
+                'started_at': datetime.now(timezone.utc).isoformat(),
+                'last_updated': None,
+                'last_url': None,
+            }
+        # تحويل القوائم إلى Sets لتسريع البحث (O(1))
+        self.scraped_set = set(data.get('scraped_urls', []))
+        self.failed_set = set(data.get('failed_urls', []))
+        return data
 
     def save(self):
         self.data['last_updated'] = datetime.now(timezone.utc).isoformat()
@@ -554,16 +569,18 @@ class CheckpointManager:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
 
     def is_scraped(self, url):
-        return url in self.data['scraped_urls']
+        return url in self.scraped_set
 
     def mark_scraped(self, url):
-        if url not in self.data['scraped_urls']:
+        if url not in self.scraped_set:
+            self.scraped_set.add(url)
             self.data['scraped_urls'].append(url)
             self.data['scraped_count'] = len(self.data['scraped_urls'])
             self.data['last_url'] = url
 
     def mark_failed(self, url, error=""):
-        if url not in self.data['failed_urls']:
+        if url not in self.failed_set:
+            self.failed_set.add(url)
             self.data['failed_urls'].append(url)
             self.data['failed_count'] = len(self.data['failed_urls'])
 
@@ -792,7 +809,7 @@ def extract_article_data(url, response):
         return None
 
 
-def scrape_articles(article_urls_dict, max_articles=None, max_workers=5):
+def scrape_articles(article_urls_dict, max_articles=None, max_workers=10):
     """
     سحب محتوى المقالات مع نظام checkpoint والتوازي (Multithreading)
     """
@@ -808,23 +825,27 @@ def scrape_articles(article_urls_dict, max_articles=None, max_workers=5):
     logger.info(f"\n📄 بدء سحب محتوى المقالات ({total:,} مقال) باستخدام {max_workers} مسارات متوازية...")
     
     scraped_articles = []
-    batch = []
-    batch_count = 0
-    skipped = 0
-    lock = threading.Lock()
-
-    # تحميل المقالات المسحوبة سابقاً
-    existing_files = [f for f in os.listdir(Config.RAW_DIR) if f.endswith('.json')]
+    
+    # تحديد رقم آخر دفعة مسجلة لتجنب الكتابة فوق الملفات القديمة
+    existing_files = [f for f in os.listdir(Config.RAW_DIR) if f.startswith('batch_') and f.endswith('.json')]
+    max_batch = 0
     for ef in existing_files:
         try:
-            with open(os.path.join(Config.RAW_DIR, ef), 'r', encoding='utf-8') as f:
-                existing_batch = json.load(f)
-                if isinstance(existing_batch, list):
-                    scraped_articles.extend(existing_batch)
-        except (json.JSONDecodeError, IOError):
+            num = int(ef.replace('batch_', '').replace('.json', ''))
+            if num > max_batch:
+                max_batch = num
+        except ValueError:
             pass
+            
+    # تغليف المتغيرات المشتركة لتجنب أخطاء المتغيرات المحلية (UnboundLocalError)
+    state = {
+        'batch': [],
+        'batch_count': max_batch,
+        'skipped': 0
+    }
+    lock = threading.Lock()
 
-    logger.info(f"   📂 مقالات موجودة مسبقاً: {len(scraped_articles):,}")
+    logger.info(f"   📂 تم اكتشاف {len(existing_files)} ملف دفعات. أحدث دفعة هي: batch_{max_batch:06d}. (لن يتم تحميل الملفات القديمة بالذاكرة)")
 
     progress_bar = tqdm(total=total, desc="📄 سحب المقالات", initial=checkpoint.data['scraped_count'])
     
@@ -854,10 +875,10 @@ def scrape_articles(article_urls_dict, max_articles=None, max_workers=5):
                 
                 with lock:
                     if status == "skipped":
-                        skipped += 1
+                        state['skipped'] += 1
                     else:
                         if status == "success":
-                            batch.append(article_data)
+                            state['batch'].append(article_data)
                             checkpoint.mark_scraped(result_url)
                         elif status == "failed_request":
                             checkpoint.mark_failed(result_url, "HTTP request failed")
@@ -865,19 +886,19 @@ def scrape_articles(article_urls_dict, max_articles=None, max_workers=5):
                             checkpoint.mark_failed(result_url, "Empty or too short content")
                         
                         progress_bar.update(1)
-                        batch_count += 1
+                        state['batch_count'] += 1
                         
                         # حفظ دوري
-                        if batch_count % Config.CHECKPOINT_EVERY == 0:
+                        if state['batch_count'] % Config.CHECKPOINT_EVERY == 0:
                             checkpoint.save()
                         
-                        if batch_count % Config.SAVE_RAW_EVERY == 0:
-                            batch_file = os.path.join(Config.RAW_DIR, f"batch_{batch_count:06d}.json")
+                        if state['batch_count'] % Config.SAVE_RAW_EVERY == 0 and state['batch']:
+                            batch_file = os.path.join(Config.RAW_DIR, f"batch_{state['batch_count']:06d}.json")
                             with open(batch_file, 'w', encoding='utf-8') as f:
-                                json.dump(batch, f, ensure_ascii=False, indent=2)
-                            scraped_articles.extend(batch)
-                            batch = []
-                            logger.info(f"   💾 حُفظت دفعة ({batch_count} مقال إجمالي)")
+                                json.dump(state['batch'], f, ensure_ascii=False, indent=2)
+                            scraped_articles.extend(state['batch'])
+                            state['batch'] = []
+                            logger.info(f"   💾 حُفظت دفعة ({state['batch_count']} مقال إجمالي)")
 
                         if batch_count % 500 == 0:
                             p = checkpoint.get_progress(total)
@@ -891,11 +912,11 @@ def scrape_articles(article_urls_dict, max_articles=None, max_workers=5):
 
     # حفظ الدفعة الأخيرة
     with lock:
-        if batch:
-            batch_file = os.path.join(Config.RAW_DIR, f"batch_{batch_count:06d}.json")
+        if state['batch']:
+            batch_file = os.path.join(Config.RAW_DIR, f"batch_{state['batch_count']:06d}.json")
             with open(batch_file, 'w', encoding='utf-8') as f:
-                json.dump(batch, f, ensure_ascii=False, indent=2)
-            scraped_articles.extend(batch)
+                json.dump(state['batch'], f, ensure_ascii=False, indent=2)
+            scraped_articles.extend(state['batch'])
 
         progress_bar.close()
         checkpoint.save()
@@ -905,7 +926,7 @@ def scrape_articles(article_urls_dict, max_articles=None, max_workers=5):
         logger.info(f"\n✅ انتهى السحب!")
         logger.info(f"   📄 مقالات ناجحة: {final['done']:,}")
         logger.info(f"   ❌ مقالات فاشلة: {final['failed']:,}")
-        logger.info(f"   ⏭️ مقالات مُتخطاة: {skipped:,}")
+        logger.info(f"   ⏭️ مقالات مُتخطاة: {state['skipped']:,}")
         logger.info(f"   🌐 إحصائيات الشبكة: {http_client.get_stats()}")
 
     return scraped_articles
@@ -1237,7 +1258,7 @@ def resume_scraping():
     progress = checkpoint.get_progress(len(urls))
     logger.info(f"   📌 التقدم الحالي: {progress['done']:,}/{progress['total']:,}")
 
-    return scrape_articles(urls, max_articles=MAX_ARTICLES)
+    return scrape_articles(urls, max_articles=None)
 
 
 def retry_failed():

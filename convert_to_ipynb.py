@@ -3,7 +3,7 @@ import sys
 
 def convert():
     try:
-        content = open('d:/lastYear/help/almrsal_scraper.py', encoding='utf-8').read()
+        content = open('d:/lastYear/help/almrsal_scraperV2.py', encoding='utf-8').read()
     except Exception as e:
         print("Error reading file:", e)
         return
@@ -49,7 +49,7 @@ def convert():
         'nbformat_minor': 5
     }
     
-    with open('d:/lastYear/help/almrsal_scraper.ipynb', 'w', encoding='utf-8') as f:
+    with open('d:/lastYear/help/almrsal_scraperV2.ipynb', 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=2, ensure_ascii=False)
         
     print("Notebook converted successfully.")

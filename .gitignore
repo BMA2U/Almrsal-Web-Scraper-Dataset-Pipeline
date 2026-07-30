@@ -15,8 +15,6 @@ venv.bak/
 
 # Project Data Directories & Outputs
 almrsal_dataset/
-raw_articles/
-dataset/
 *.log
 
 # Temporary test scripts and outputs
@@ -26,3 +24,5 @@ test_output.json
 # OS generated files
 .DS_Store
 Thumbs.db
+
+Almrsal-Web-Scraper-Dataset-Pipeline.rar
